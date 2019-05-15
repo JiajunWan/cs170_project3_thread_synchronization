@@ -9,16 +9,21 @@
 #include <sys/wait.h>
 #include <setjmp.h>
 #include <time.h>
+#include <semaphore.h>
 
+#define SEM_VALUE_MAX 65536
+#define MAX_SEMAPHORE 128
 #define MAX_THREADS 128
 #define MAX_QUEUE 129
 #define INTERVAL 50
+#define ESRCH 3
 
 enum STATE
 {
     ACTIVE,
-    READY,
-    EXITED
+    BLOCKED,
+    EXITED,
+    REAPED
 };
 
 struct ThreadControlBlock
@@ -29,12 +34,28 @@ struct ThreadControlBlock
     void *(*start_routine)(void *);
     void *arg;
     jmp_buf Registers;
+    int CallingThreadTCBIndex;
+    int JustCreated;
+    void *ReturnValue;
 };
 
 struct TCBPool
 {
     /* Maximum 129 concurrent running threads including main thread whose TCB Index is 0 */
     struct ThreadControlBlock TCB[MAX_THREADS + 1];
+};
+
+struct Semaphore
+{
+    unsigned int ID;
+    unsigned int Value;
+    int semaphore_max;
+    int Initialized;
+};
+
+struct SemaphorePool
+{
+    struct Semaphore semaphore[MAX_SEMAPHORE];
 };
 
 struct queue
@@ -59,11 +80,19 @@ void Scheduler();
 
 void WrapperFunction();
 
+void lock();
+
+void unlock();
+
 static long int i64_ptr_mangle(long int p);
 
 struct queue SchedulerThreadPoolIndexQueue = {0, -1, 0};
 
+struct queue Queue[MAX_SEMAPHORE];
+
 struct TCBPool ThreadPool;
+
+struct SemaphorePool SemPool;
 
 static int Initialized = 0;
 
@@ -71,15 +100,20 @@ static int NextCreateTCBIndex = 1;
 
 static unsigned long ThreadID = 1;
 
+static int SemaphoreID = 0;
+
+static int SemaphoreCount = 0;
+
 static struct sigaction sigact;
 static struct itimerval Timer;
 static struct itimerval Zero_Timer = {0};
+static sigset_t mask;
 
 void WrapperFunction()
 {
     int TCBIndex = peekfront(&SchedulerThreadPoolIndexQueue);
-    ThreadPool.TCB[TCBIndex].start_routine(ThreadPool.TCB[TCBIndex].arg);
-    pthread_exit(0);
+    void *ReturnValue = ThreadPool.TCB[TCBIndex].start_routine(ThreadPool.TCB[TCBIndex].arg);
+    pthread_exit(ReturnValue);
 }
 
 void main_thread_init()
@@ -87,7 +121,7 @@ void main_thread_init()
     int i;
     for (i = 1; i < MAX_THREADS + 1; i++)
     {
-        ThreadPool.TCB[i].Status = EXITED;
+        ThreadPool.TCB[i].Status = REAPED;
     }
     Initialized = 1;
 
@@ -97,7 +131,9 @@ void main_thread_init()
     ThreadPool.TCB[0].ESP = NULL;
     ThreadPool.TCB[0].start_routine = NULL;
     ThreadPool.TCB[0].arg = NULL;
-    setjmp(ThreadPool.TCB[0].Registers);
+    ThreadPool.TCB[0].CallingThreadTCBIndex = -1;
+    ThreadPool.TCB[0].JustCreated = 1;
+    ThreadPool.TCB[0].ReturnValue = NULL;
     pushback(&SchedulerThreadPoolIndexQueue, 0);
 
     sigact.sa_handler = Scheduler;
@@ -117,6 +153,7 @@ void main_thread_init()
         perror("Error calling setitimer()");
         exit(1);
     }
+    setjmp(ThreadPool.TCB[0].Registers);
 }
 
 int pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start_routine)(void *), void *arg)
@@ -137,7 +174,7 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start_
         int i;
         for (i = 1; i < MAX_QUEUE; i++)
         {
-            if (ThreadPool.TCB[i].Status == EXITED)
+            if (ThreadPool.TCB[i].Status == REAPED)
             {
                 NextCreateTCBIndex = i;
                 break;
@@ -150,6 +187,9 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start_
         ThreadPool.TCB[NextCreateTCBIndex].Status = ACTIVE;
         ThreadPool.TCB[NextCreateTCBIndex].start_routine = start_routine;
         ThreadPool.TCB[NextCreateTCBIndex].arg = arg;
+        ThreadPool.TCB[NextCreateTCBIndex].CallingThreadTCBIndex = -1;
+        ThreadPool.TCB[NextCreateTCBIndex].JustCreated = 1;
+        ThreadPool.TCB[NextCreateTCBIndex].ReturnValue = NULL;
         *thread = ThreadPool.TCB[NextCreateTCBIndex].ThreadID;
 
         /* Setjmp */
@@ -165,7 +205,7 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start_
         ThreadPool.TCB[NextCreateTCBIndex].Registers[0].__jmpbuf[7] = i64_ptr_mangle((unsigned long)WrapperFunctionPointer);
 
         /* Add the New Thread Thread Pool Index to the second place in the Queue in case of segfault when freeing esp of last thread with high index*/
-        pushsecond(&SchedulerThreadPoolIndexQueue, NextCreateTCBIndex);
+        pushback(&SchedulerThreadPoolIndexQueue, NextCreateTCBIndex);
 
         /* Resume Timer */
         setitimer(ITIMER_REAL, &Timer, NULL);
@@ -193,9 +233,9 @@ void pthread_exit(void *value_ptr)
         exit(0);
     }
 
+    lock();
+
     int Index = popfront(&SchedulerThreadPoolIndexQueue);
-    /* Stop Timer */
-    setitimer(ITIMER_REAL, &Zero_Timer, NULL);
 
     /* If exit last thread, first free, and then exit */
     if (size(&SchedulerThreadPoolIndexQueue) == 0)
@@ -204,6 +244,7 @@ void pthread_exit(void *value_ptr)
         {
             free((unsigned long *)ThreadPool.TCB[Index].ESP);
         }
+        unlock();
         exit(0);
     }
 
@@ -212,38 +253,305 @@ void pthread_exit(void *value_ptr)
     {
         free((unsigned long *)ThreadPool.TCB[Index].ESP);
     }
-    ThreadPool.TCB[Index].ThreadID = 0;
     ThreadPool.TCB[Index].ESP = NULL;
     ThreadPool.TCB[Index].start_routine = NULL;
     ThreadPool.TCB[Index].arg = NULL;
     ThreadPool.TCB[Index].Status = EXITED;
-
-    /* Start Timer */
-    setitimer(ITIMER_REAL, &Timer, NULL);
+    ThreadPool.TCB[Index].ReturnValue = value_ptr;
+    if (ThreadPool.TCB[Index].CallingThreadTCBIndex != -1)
+    {
+        ThreadPool.TCB[ThreadPool.TCB[Index].CallingThreadTCBIndex].Status = ACTIVE;
+    }
+    pushback(&SchedulerThreadPoolIndexQueue, Index);
 
     /* Longjmp to the front(next) thread registers */
-    longjmp(ThreadPool.TCB[peekfront(&SchedulerThreadPoolIndexQueue)].Registers, 1);
+    Index = peekfront(&SchedulerThreadPoolIndexQueue);
+    while (ThreadPool.TCB[Index].Status == BLOCKED || ThreadPool.TCB[Index].Status == EXITED || ThreadPool.TCB[Index].Status == REAPED)
+    {
+        /* If the thread is not reaped, then pushback the front Thread Pool Index of the saved thread to the end of queue */
+        if (ThreadPool.TCB[Index].Status != REAPED)
+        {
+            pushback(&SchedulerThreadPoolIndexQueue, Index);
+        }
+        popfront(&SchedulerThreadPoolIndexQueue);
+        Index = peekfront(&SchedulerThreadPoolIndexQueue);
+    }
+
+    unlock();
+
+    longjmp(ThreadPool.TCB[Index].Registers, 1);
+}
+
+int pthread_join(pthread_t thread, void **value_ptr)
+{
+    lock();
+    int i = 0;
+    int found = 0;
+    int Index = 0;
+    int TargetThreadTCBIndex = 0;
+    int CallingThreadTCBIndex = peekfront(&SchedulerThreadPoolIndexQueue);
+    while (i < SchedulerThreadPoolIndexQueue.itemCount)
+    {
+        Index = popfront(&SchedulerThreadPoolIndexQueue);
+
+        /* Find the target thread in queue */
+        if (ThreadPool.TCB[Index].ThreadID == thread)
+        {
+            found = 1;
+            TargetThreadTCBIndex = i;
+            /* If the thread has already been reaped, then return ESRCH */
+            if (ThreadPool.TCB[i].Status == REAPED)
+            {
+                return ESRCH;
+            }
+        }
+        pushback(&SchedulerThreadPoolIndexQueue, Index);
+        i++;
+    }
+
+    /* If not found, then return the errorno */
+    if (!found)
+    {
+        return ESRCH;
+    }
+
+    /* If the thread has already exited, then just reap it */
+    if (ThreadPool.TCB[TargetThreadTCBIndex].Status == EXITED)
+    {
+        ThreadPool.TCB[TargetThreadTCBIndex].ThreadID = 0;
+        ThreadPool.TCB[TargetThreadTCBIndex].Status = REAPED;
+        ThreadPool.TCB[TargetThreadTCBIndex].CallingThreadTCBIndex = -1;
+        if (value_ptr != NULL)
+        {
+            *value_ptr = ThreadPool.TCB[TargetThreadTCBIndex].ReturnValue;
+        }
+        ThreadPool.TCB[TargetThreadTCBIndex].ReturnValue = NULL;
+        return 0;
+    }
+
+    /* Block and store the TCB Index of calling thread */
+    ThreadPool.TCB[TargetThreadTCBIndex].CallingThreadTCBIndex = CallingThreadTCBIndex;
+    ThreadPool.TCB[CallingThreadTCBIndex].Status = BLOCKED;
+
+    unlock();
+
+    Scheduler();
+
+    lock();
+
+    if (value_ptr != NULL)
+    {
+        *value_ptr = ThreadPool.TCB[TargetThreadTCBIndex].ReturnValue;
+    }
+
+    /* Reap the Target Thread */
+    ThreadPool.TCB[TargetThreadTCBIndex].ThreadID = 0;
+    ThreadPool.TCB[TargetThreadTCBIndex].Status = REAPED;
+    ThreadPool.TCB[TargetThreadTCBIndex].CallingThreadTCBIndex = -1;
+    ThreadPool.TCB[TargetThreadTCBIndex].ReturnValue = NULL;
+
+    unlock();
+
+    /* Join succeeds */
+    return 0;
 }
 
 void Scheduler()
 {
+    lock();
     /* If only one main thread, just return */
     if (size(&SchedulerThreadPoolIndexQueue) <= 1)
     {
+        unlock();
         return;
     }
 
-    if (setjmp(ThreadPool.TCB[peekfront(&SchedulerThreadPoolIndexQueue)].Registers) == 0)
+    int Index = peekfront(&SchedulerThreadPoolIndexQueue);
+
+    if (setjmp(ThreadPool.TCB[Index].Registers) == 0)
     {
         /* Pushback the poped front Thread Pool Index of the saved thread to the end of queue */
-        int Index = peekfront(&SchedulerThreadPoolIndexQueue);
         pushback(&SchedulerThreadPoolIndexQueue, Index);
         popfront(&SchedulerThreadPoolIndexQueue);
+        Index = peekfront(&SchedulerThreadPoolIndexQueue);
+        /* Loop through the queue if the front thread is blocked or exited */
+        while (ThreadPool.TCB[Index].Status == BLOCKED || ThreadPool.TCB[Index].Status == EXITED || ThreadPool.TCB[Index].Status == REAPED)
+        {
+            /* If the thread is not reaped, then pushback the front Thread Pool Index of the saved thread to the end of queue */
+            if (ThreadPool.TCB[Index].Status != REAPED)
+            {
+                pushback(&SchedulerThreadPoolIndexQueue, Index);
+            }
+            popfront(&SchedulerThreadPoolIndexQueue);
+            Index = peekfront(&SchedulerThreadPoolIndexQueue);
+        }
+        if (ThreadPool.TCB[Index].JustCreated)
+        {
+            unlock();
+            ThreadPool.TCB[Index].JustCreated = 0;
+        }
 
         /* Longjmp to the front(next) thread registers */
-        longjmp(ThreadPool.TCB[peekfront(&SchedulerThreadPoolIndexQueue)].Registers, 1);
+        longjmp(ThreadPool.TCB[Index].Registers, 1);
     }
-    return;
+    else
+    {
+        unlock();
+        return;
+    }
+}
+
+void lock()
+{
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGALRM);
+    if (sigprocmask(SIG_BLOCK, &mask, NULL) < 0)
+    {
+        perror("Error:");
+        exit(1);
+    }
+}
+
+void unlock()
+{
+    if (sigprocmask(SIG_UNBLOCK, &mask, NULL) < 0)
+    {
+        perror("Error:");
+        exit(1);
+    }
+}
+
+int sem_init(sem_t *sem, int pshared, unsigned int value)
+{
+    if (sem == NULL)
+    {
+        return -1;
+    }
+    if (pshared != 0)
+    {
+        return -1;
+    }
+    if (value > SEM_VALUE_MAX)
+    {
+        return -1;
+    }
+    int i;
+    for (i = 0; i < MAX_SEMAPHORE; i++)
+    {
+        if (!SemPool.semaphore[i].Initialized)
+        {
+            SemaphoreID = i;
+            break;
+        }
+    }
+
+    lock();
+    SemPool.semaphore[SemaphoreID].ID = SemaphoreID;
+    SemPool.semaphore[SemaphoreID].Value = value;
+    SemPool.semaphore[SemaphoreID].Initialized = 1;
+    Queue[SemaphoreID].front = 0;
+    Queue[SemaphoreID].rear = -1;
+    Queue[SemaphoreID].itemCount = 0;
+    sem->__align = SemPool.semaphore[SemaphoreID].ID;
+    SemaphoreCount++;
+    unlock();
+
+    return 0;
+}
+
+int sem_destroy(sem_t *sem)
+{
+    if (sem == NULL)
+    {
+        return -1;
+    }
+
+    lock();
+
+    int ID = sem->__align;
+
+    if (!SemPool.semaphore[ID].Initialized)
+    {
+        return -1;
+    }
+
+    if (Queue[ID].itemCount > 0)
+    {
+        return -1;
+    }
+
+    SemPool.semaphore[ID].ID = 0;
+    SemPool.semaphore[ID].Value = 0;
+    SemPool.semaphore[ID].Initialized = 0;
+    Queue[SemaphoreID].front = 0;
+    Queue[SemaphoreID].rear = -1;
+    Queue[SemaphoreID].itemCount = 0;
+    SemaphoreCount--;
+
+    unlock();
+
+    return 0;
+}
+
+int sem_wait(sem_t *sem)
+{
+    if (sem == NULL)
+    {
+        return -1;
+    }
+
+    lock();
+
+    int ID = sem->__align;
+
+    if (!SemPool.semaphore[ID].Initialized)
+    {
+        return -1;
+    }
+
+    if (SemPool.semaphore[ID].Value > 0)
+    {
+        SemPool.semaphore[ID].Value -= 1;
+        unlock();
+    }
+    else
+    {
+        int Index = peekfront(&SchedulerThreadPoolIndexQueue);
+        ThreadPool.TCB[Index].Status = BLOCKED;
+        pushback(&Queue[ID], Index);
+        unlock();
+        Scheduler();
+    }
+}
+
+int sem_post(sem_t *sem)
+{
+    if (sem == NULL)
+    {
+        return -1;
+    }
+
+    lock();
+
+    int ID = sem->__align;
+
+    if (!SemPool.semaphore[ID].Initialized)
+    {
+        return -1;
+    }
+
+    if (SemPool.semaphore[ID].Value > 0)
+    {
+        SemPool.semaphore[ID].Value += 1;
+        unlock();
+    }
+    else
+    {
+        int Index = popfront(&Queue[ID]);
+        ThreadPool.TCB[Index].Status = ACTIVE;
+        unlock();
+        Scheduler();
+    }
 }
 
 int peekfront(struct queue *Queue)
@@ -281,7 +589,7 @@ void pushsecond(struct queue *Queue, int Index)
     int i;
     for (i = Queue->rear; i > Queue->front + 1; i--)
     {
-        Queue->IndexQueue[i] = Queue->IndexQueue[i-1];
+        Queue->IndexQueue[i] = Queue->IndexQueue[i - 1];
     }
     Queue->IndexQueue[Queue->front + 1] = Index;
     Queue->itemCount += 1;

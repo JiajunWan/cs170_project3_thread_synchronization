@@ -1,10 +1,7 @@
 all: p3_grader
 
-autograder_main.o: autograder_main.c
-	gcc -c -o autograder_main.o autograder_main.c
-
-p3_grader: autograder_main.o threads.o
-	gcc -o p3_grader autograder_main.o threads.o
+p3_grader: autograder_main.c thread_lib
+	gcc autograder_main.c threads.o -o p3_grader
 
 thread_lib: pthread.c
 	gcc -c pthread.c -o threads.o
